@@ -69,8 +69,14 @@ class TestsGeneric:
         """
         Console output should be redirected to serial for HVM instances.
         """
-        assert host.file('/proc/cmdline').contains('console=ttyS0'), \
-            'Serial console should be redirected to ttyS0'
+        if instance_data['cloud'] == 'azure' and host.system_info.arch == 'aarch64':
+            assert not host.file('/proc/cmdline').contains('console=ttyS0'), \
+                'Serial console can not be redirected to ttyS0 on Azure arm64'
+            assert host.file('/proc/cmdline').contains('console=ttyAMA0'), \
+                'Serial console should be redirected to ttyAMA0 on Azure arm64'
+        else:
+            assert host.file('/proc/cmdline').contains('console=ttyS0'), \
+                'Serial console should be redirected to ttyS0'
 
     # TODO: does this apply to fedora and centos
     @pytest.mark.run_on(['rhel'])
