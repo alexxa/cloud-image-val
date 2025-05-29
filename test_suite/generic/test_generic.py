@@ -327,7 +327,7 @@ class TestsGeneric:
         BugZilla 1960628
         SELinux should be in enforcing/targeted mode
         """
-        if test_lib.is_rhel_sap(host):
+        if test_lib.is_rhel_sap(host) and version.parse(host.system_info.release).major < 10:
             expected_mode = 'Permissive'
         else:
             expected_mode = 'Enforcing'
