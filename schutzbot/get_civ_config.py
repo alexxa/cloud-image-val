@@ -11,6 +11,7 @@ import subprocess
 import sys
 import yaml
 from pprint import pprint
+import pytest
 
 # Define test file locations
 CLOUD_TEST_FILES = {
@@ -58,7 +59,7 @@ def get_method_changes_for_file(test_file):
     """
     Analyzes the git diff for a specific file to find changed test methods,
     including modifications within existing methods.
-    Returns a set of method names that were affected by changes.
+    Returns a dictionary of method names and their markers that were affected by changes.
     """
     try:
         # Use -U10000 to get a large context, which is necessary to reliably
@@ -74,10 +75,10 @@ def get_method_changes_for_file(test_file):
         )
 
     except subprocess.CalledProcessError:
-        return set()
+        return {}
 
     diff_lines = diff_output.stdout.splitlines()
-    changed_methods = set()
+    changed_methods_names = set()
     # Regex to capture method definitions.
     method_pattern = re.compile(r'^\s*def\s+(test_\w+)\s*\(.*?\):')
 
@@ -91,10 +92,32 @@ def get_method_changes_for_file(test_file):
                 match = method_pattern.match(clean_line)
                 if match:
                     # We found the enclosing method. Add it to the set and break.
-                    changed_methods.add(match.group(1))
+                    changed_methods_names.add(match.group(1))
                     break
 
-    return changed_methods
+    # Use pytest to get markers for these methods
+    changed_methods_with_markers = {}
+    if not changed_methods_names:
+        return changed_methods_with_markers
+
+    # Run pytest in collection mode
+    class Collector:
+        def __init__(self):
+            self.nodes = []
+
+        def pytest_collection_finish(self, session):
+            self.nodes = session.items
+
+    collector = Collector()
+    pytest.main([test_file, "--collect-only"], plugins=[collector])
+
+    for node in collector.nodes:
+        method_name = node.name
+        if method_name in changed_methods_names:
+            markers = [m.name for m in node.own_markers]
+            changed_methods_with_markers[method_name] = markers
+
+    return changed_methods_with_markers
 
 
 def detect_if_only_specific_methods_changed(files_changed):
@@ -103,8 +126,8 @@ def detect_if_only_specific_methods_changed(files_changed):
     or generic test files, or if a broader change requires a full test run.
     Returns a dictionary with 'mode' and 'trigger_files' for auditability.
     """
-    cloud_methods = {cloud: set() for cloud in CLOUD_TEST_FILES}
-    generic_methods = set()
+    cloud_methods = {cloud: {} for cloud in CLOUD_TEST_FILES}
+    generic_methods = {}
     trigger_files = []
 
     for f in files_changed:
@@ -162,6 +185,28 @@ def detect_if_only_specific_methods_changed(files_changed):
     # Case 3: Fallback for other scenarios, including no changes or a mix of cloud/generic method changes
     return {'mode': 'full', 'reason': 'No specific method changes or mixed changes detected', 'trigger_files': []}
 
+def build_pytest_filter(methods_with_markers):
+    """
+    Builds a combined pytest filter string from a dictionary of methods and their markers.
+    The filter is designed to keep the 'not pub' marker while overriding it for changed tests.
+    """
+    all_methods = set()
+    has_pub_marker = False
+
+    for method_name, markers in methods_with_markers.items():
+        all_methods.add(method_name)
+        if 'pub' in markers:
+            has_pub_marker = True
+
+    # Use a single filter for both keywords and markers
+    method_filter = " or ".join(all_methods)
+
+    final_filter = f'({method_filter})'
+    if has_pub_marker:
+        final_filter += ' or pub'
+
+    return final_filter
+
 
 def write_vars_file(vars, vars_file_path):
     with open(vars_file_path, 'w+') as vars_file:
@@ -206,23 +251,20 @@ if __name__ == '__main__':
         civ_config['test_filter'] = ''
     elif run_mode['mode'] == 'cloud_methods':
         # Only run impacted clouds and collect all changed methods
-        all_methods = set()
-        for cloud in CLOUD_TEST_FILES:
-            if cloud in run_mode['clouds']:
-                vars[f'SKIP_{cloud.upper()}'] = 'false'
-                all_methods.update(run_mode['methods'][cloud])
-            else:
-                vars[f'SKIP_{cloud.upper()}'] = 'true'
+        all_methods_with_markers = {}
+        for cloud in run_mode['clouds']:
+            vars[f'SKIP_{cloud.upper()}'] = 'false'
+            all_methods_with_markers.update(run_mode['methods'][cloud])
 
         # Build the final pytest filter from all collected methods
-        civ_config['test_filter'] = ' or '.join(all_methods)
+        civ_config['test_filter'] = build_pytest_filter(all_methods_with_markers)
 
     elif run_mode['mode'] == 'generic_methods':
         # Run all clouds, but only the changed generic methods
         vars['SKIP_AWS'] = 'false'
         vars['SKIP_AZURE'] = 'false'
         vars['SKIP_GCP'] = 'false'
-        civ_config['test_filter'] = ' or '.join(run_mode['methods']['generic'])
+        civ_config['test_filter'] = build_pytest_filter(run_mode['methods']['generic'])
 
     # Additional config from env vars
     if os.getenv("CLOUDX_PKG_TESTING", "false").lower() == "true":
